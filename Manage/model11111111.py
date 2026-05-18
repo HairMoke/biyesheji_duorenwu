@@ -1,0 +1,846 @@
+'''
+Author: Tammie li
+Description: Define model
+FilePath: \model.py
+添加了频域的模型
+'''
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from einops import rearrange
+from module_test.SimAM import Simam_module
+from module_test.ECAAttention import ECAAttention
+from module_test.ChannelAttention import CBAM
+from module_test.Conv_Blocks import Inception_Block_V1,ConvNeXt,EEGInception,EEGChannel_3,EEGInception_test
+from module_test.medgnn.layers.Embed import Multi_Resolution_Data, Frequency_Embedding
+from module_test.medgnn.layers.Medformer_EncDec import Encoder, EncoderLayer
+from module_test.medgnn.layers.SelfAttention_Family import FormerLayer, DifferenceFormerlayer
+from module_test.medgnn.layers.Multi_Resolution_GNN import MRGNN
+from module_test.medgnn.layers.Difference_Pre import DifferenceDataEmb, DataRestoration
+
+
+class MTCN(nn.Module):
+    def __init__(self, n_class_primary, T = 256, channels=64, n_kernel_t=8, n_kernel_s=16, dropout=0.5, kernel_length=32):
+        super(MTCN, self).__init__()
+
+        self.n_class_primary = n_class_primary
+        self.channels = channels
+        self.n_kernel_t = n_kernel_t
+        self.n_kernel_s = n_kernel_s
+        self.dropout = dropout
+        self.kernel_length = kernel_length
+
+
+        self.block_shared_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),    #  [32, 1, 64, 287]
+            nn.Conv2d(1, 8, (1, 32), bias=False),  # [32, 8, 64, 287]
+            nn.BatchNorm2d(8),
+            # 原block2
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        self.block_specific_main_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        '''
+        self.block_specific_mtr_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+        self.block_specific_msr_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+        self.block_specific_ftr_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        '''
+        # 增强时域掩码任务的特征提取器，使用多尺度时序卷积增强时域特征提取能力
+        self.block_specific_mtr_feature_extractor = nn.Sequential(
+            # 原block1 - 使用多尺度时序卷积增强时域特征提取
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 添加多尺度时序特征提取模块
+            nn.Conv2d(8, 8, (1, 3), padding=(0, 1), bias=False),  # 小尺度感受野
+            nn.ELU(),
+            nn.Conv2d(8, 8, (1, 5), padding=(0, 2), bias=False),  # 中尺度感受野
+            nn.ELU(),
+            nn.Conv2d(8, 8, (1, 7), padding=(0, 3), bias=False),  # 大尺度感受野
+            nn.ELU(),
+            # 原block2 - 空间处理保持不变
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        # 增强空域掩码任务的特征提取器，使用空间注意力机制增强空间特征提取能力
+        self.block_specific_msr_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2 - 增强空间特征提取
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU()
+        )
+        
+        # 添加空间注意力模块
+        self.msr_spatial_attention = nn.Sequential(
+            # 空间注意力模块
+            nn.Conv2d(16, 1, kernel_size=7, padding=3),  # 大卷积核捕获空间依赖
+            nn.Sigmoid()
+        )
+        
+        # 添加空间特征后处理
+        self.msr_post_process = nn.Sequential(
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        # 增强频域掩码任务的特征提取器，使用多尺度空洞卷积增强频域特征提取能力
+        self.block_specific_ftr_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8)
+        )
+        
+        # 添加多尺度空洞卷积模块 (MDFA简化版) 用于频域特征提取
+        self.ftr_mdfa = nn.ModuleDict({
+            # 不同空洞率的卷积分支
+            'branch1': nn.Sequential(
+                nn.Conv2d(8, 4, 3, 1, padding=1, dilation=1),
+                nn.BatchNorm2d(4),
+                nn.ReLU(inplace=True)
+            ),
+            'branch2': nn.Sequential(
+                nn.Conv2d(8, 4, 3, 1, padding=2, dilation=2),
+                nn.BatchNorm2d(4),
+                nn.ReLU(inplace=True)
+            ),
+            'branch3': nn.Sequential(
+                nn.Conv2d(8, 4, 3, 1, padding=3, dilation=3),
+                nn.BatchNorm2d(4),
+                nn.ReLU(inplace=True)
+            ),
+            'branch4': nn.Sequential(
+                nn.Conv2d(8, 4, 1, 1, padding=0),
+                nn.BatchNorm2d(4),
+                nn.ReLU(inplace=True)
+            ),
+            # 合并分支
+            'fusion': nn.Sequential(
+                nn.Conv2d(16, 16, 1, 1, padding=0),
+                nn.BatchNorm2d(16),
+                nn.ELU()
+            )
+        })
+        
+        # 添加频域特征后处理
+        self.ftr_post_process = nn.Sequential(
+            nn.Conv2d(16, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        self.block_feature_fusion = nn.Sequential(
+            nn.ZeroPad2d((self.kernel_length//8-1, self.kernel_length//8, 0, 0)),
+            nn.Conv2d(self.n_kernel_s, self.n_kernel_s, (1, self.kernel_length//4), groups=self.n_kernel_s, bias=False),
+            nn.Conv2d(self.n_kernel_s, self.n_kernel_s, (1, 1), bias=False),
+            nn.BatchNorm2d(self.n_kernel_s),
+            nn.ELU()
+        )
+        self.main_task_projection_head =  nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+        self.vto_task_projection_head =  nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+        self.msp_task_projection_head =  nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+        self.ftr_task_projection_head = nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+
+        # Fully-connected layer
+        self.primary_task_classifier = nn.Sequential(
+            # nn.Linear(self.n_kernel_s*T * 2 //32, self.n_class_primary)  # 图像用的这个
+            nn.Linear(self.n_kernel_s*T //32, self.n_class_primary)
+        )
+        self.vto_task_classifier = nn.Sequential(
+            nn.Linear(self.n_kernel_s*T//32, 9)
+        )
+        self.msp_task_classifier = nn.Sequential(
+            nn.Linear(self.n_kernel_s*T//32, 8)
+        )
+        self.ftr_task_classifier = nn.Sequential(
+            nn.Linear(self.n_kernel_s*T // 32, 10)
+        )
+
+        self.eca = nn.Sequential(
+            ECAAttention(kernel_size=3)  # 实例化ECA注意力模块，指定核大小为3
+        )
+        self.cbam = nn.Sequential(
+            CBAM(64)
+        )
+
+
+
+    def calculate_orthogonal_constraint(self, feature_1, feature_2):
+        '''
+        计算两个特征矩阵之间的正交约束损失，以确保它们在统计上尽可能正交（即相互独立）
+        数学原理：若两个特征完全正交（即 feature_1^T feature_2 = 0），则它们的协方差为零，彼此独立。通过最小化非对角线元素的平方和，间接约束两者的内积接近零，从而实现正交性。
+        确保共享特征专注于通用性，任务特定特征专注于任务差异性，从而提升特征的可区分性。
+        '''
+        assert feature_1.shape == feature_2.shape, "the dimension of two matrix is not equal"  # 确保输入的两个特征矩阵维度一致。
+        N, channels, H, W = feature_1.shape
+        feature_1, feature_2 = torch.reshape(feature_1, (N*channels, H, W)), torch.reshape(feature_2, (N*channels, H, W))  # 原始形状 (N, channels, H, W) → reshape为 (N*channels, H, W)。
+        weight_squared = torch.bmm(feature_1, feature_2.permute(0, 2, 1)) #使用 torch.bmm 计算两个三维矩阵的批量矩阵乘积： permute()就是转置，将矩阵转置为 (N*channels, W, H)。
+        # weight_squared = torch.norm(weight_squared, p=2)
+        # ones = torch.ones(N*channels, H, H, dtype=torch.float32).to(torch.device('cuda:0')) # 创建全1矩阵 ones 和单位矩阵 diag
+        # diag = torch.eye(H, dtype=torch.float32).to(torch.device('cuda:0'))
+        ones = torch.ones(N * channels, H, H, dtype=torch.float32, device=feature_1.device)
+        diag = torch.eye(H, dtype=torch.float32, device=feature_1.device)
+
+        loss = ((weight_squared * (ones - diag)) ** 2).sum() # 计算非对角线元素的平方和：ones - diag:将单位矩阵的对角线置零，保留非对角线元素。 weight_squared * (ones - diag)：仅保留 weight_squared 的非对角线部分。
+        return loss  # 返回一个标量 loss，表示两个特征矩阵的非正交程度。该损失函数会作为训练的惩罚项，通过反向传播优化模型参数，迫使 feature_1 和 feature_2 的统计相关性降低。
+
+    def forward(self, x, task_name):
+        '''
+        @description: Complete the corresponding task according to the task tag
+        X； [32, 64, 256]
+        x_pic:(32,64,256,256)
+        '''
+        # extract features
+        # print("送进来： x.shape: ")
+        # print(x.shape) # X； [32, 64, 256]
+        # B,C,T = x.size()
+        # x = x.view(1, B, C, T)
+        # x = x.ca(x)
+        # x = x.view(B, C, T)
+        x = torch.reshape(x, (x.shape[0], 1, x.shape[1], x.shape[2])) # [32,1,64,256]
+
+
+        # x = torch.reshape(x, (x.shape[0], x.shape[2], x.shape[1], x.shape[3]))  # 应该调整成 [32,64,1,256]
+        # x = self.eca(x)
+        # x = self.cbam(x)
+        # x = torch.reshape(x, (x.shape[0], x.shape[2], x.shape[1], x.shape[3]))  # [32, 1, 64, 256]
+
+        fea_shared_extract = self.block_shared_feature_extractor(x)  # [32, 16, 1, 64]
+        fea_after_fusion = self.block_feature_fusion(fea_shared_extract) # [32, 16, 1, 64] # vto(288,16,1,64) # msp(256,16,1,64) # ftr(320,16,1,64)
+
+        if task_name == "main":
+            # print("main ---- x.shape: ")
+            # print(x.shape)   # [32, 1, 64, 256]
+
+
+            # 推理过程
+            fea_specific_main = self.block_specific_main_feature_extractor(x) #[32, 16, 1, 64]
+            # 融合特征
+            fea_main = fea_specific_main + fea_after_fusion #[32, 16, 1, 64]
+            # 消融实验。消掉特定特征
+            # fea_main = fea_after_fusion #[32, 16, 1, 64]
+
+
+            fea_main = self.main_task_projection_head(fea_main)  # ([32, 16, 1, 8])   (32,32,1,8)
+            # fea_main = self.eca(fea_main)
+            fea_main = fea_main.view(fea_main.size(0), -1) # [32, 128]  (32,256)
+            logits_main = self.primary_task_classifier(fea_main) # [32, 2]
+            pred_main = F.softmax(logits_main, dim = 1) # [32, 2]
+            orthogonal_constraint = self.calculate_orthogonal_constraint(fea_specific_main, fea_shared_extract)
+            # orthogonal_constraint = 0  # 消融实验。消掉特定特征之后，我们的正交损失应该等于0
+
+            return pred_main, orthogonal_constraint
+
+        elif task_name == "vto":
+            # print("vto ---- x.shape: ")
+            # print(x.shape)  # [288, 1, 64, 256]
+            # x = torch.reshape(x, (x.shape[1], x.shape[2], x.shape[0], x.shape[3]))
+            # x = self.eca(x)
+            # x = torch.reshape(x, (x.shape[2], x.shape[0], x.shape[1], x.shape[3]))  # [32, 1, 64, 256]
+            # 推理过程
+            fea_specific_vto = self.block_specific_mtr_feature_extractor(x) #(288,16,1,64)
+            fea_vto = (fea_specific_vto + fea_after_fusion)  # (288,16,1,64) = (288,16,1,64) + (288,16,1,64)
+
+
+            fea_vto = self.vto_task_projection_head(fea_vto) # ([288, 16, 1, 8])
+            # fea_vto = self.eca(fea_vto)
+            fea_vto = fea_vto.view(fea_vto.size(0), -1) #(288, 128)
+            logits_vto = self.vto_task_classifier(fea_vto)  #(288,9)
+            pred_vto = F.softmax(logits_vto, dim = 1) #(288,9)
+            # 损失计算
+            orthogonal_constraint = self.calculate_orthogonal_constraint(fea_specific_vto, fea_shared_extract)
+
+            return pred_vto, orthogonal_constraint
+
+        elif task_name == "msp":
+            # print("msp ---- x.shape: ")
+            # print(x.shape)  # [256, 1, 64, 256]
+            # x = torch.reshape(x, (x.shape[1], x.shape[2], x.shape[0], x.shape[3]))
+            # x = self.eca(x)
+            # x = torch.reshape(x, (x.shape[2], x.shape[0], x.shape[1], x.shape[3]))  # [32, 1, 64, 256]
+            # 推理过程 - 使用增强的空间特征提取器
+            fea_specific_msp_pre = self.block_specific_msr_feature_extractor(x) #(256,16,1,256)
+            # 应用空间注意力
+            spatial_attention = self.msr_spatial_attention(fea_specific_msp_pre) # (256,1,1,256)
+            fea_specific_msp_enhanced = fea_specific_msp_pre * spatial_attention # (256,16,1,256)
+            # 应用后处理
+            fea_specific_msp = self.msr_post_process(fea_specific_msp_enhanced) # (256,16,1,64)
+            fea_msp = (fea_specific_msp + fea_after_fusion)  # (256,16,1,64) = (256,16,1,64) + (256,16,1,64)
+
+            fea_msp = self.msp_task_projection_head(fea_msp) # ([256, 16, 1, 8])
+            # fea_msp = self.eca(fea_msp)
+            fea_msp = fea_msp.view(fea_msp.size(0), -1) #(256,128)
+            logits_msp = self.msp_task_classifier(fea_msp) #(256,8)
+            pred_msp = F.softmax(logits_msp, dim = 1) #(256,8)
+            # 损失计算
+            orthogonal_constraint = self.calculate_orthogonal_constraint(fea_specific_msp, fea_shared_extract)
+
+            return pred_msp, orthogonal_constraint
+        elif task_name == "ftr":
+            # print("ftr ---- x.shape: ")
+            # print(x.shape)  # [160, 1, 64, 256]
+            # 推理过程 - 使用增强的频域特征提取器
+            fea_specific_ftr_pre = self.block_specific_ftr_feature_extractor(x) # [160, 8, 64, 256] # 初始特征提取
+            
+            # 应用多尺度空洞卷积模块
+            branch1_out = self.ftr_mdfa['branch1'](fea_specific_ftr_pre) # [160, 4, 64, 256]
+            branch2_out = self.ftr_mdfa['branch2'](fea_specific_ftr_pre) # [160, 4, 64, 256]
+            branch3_out = self.ftr_mdfa['branch3'](fea_specific_ftr_pre) # [160, 4, 64, 256]
+            branch4_out = self.ftr_mdfa['branch4'](fea_specific_ftr_pre) # [160, 4, 64, 256]
+            ## TODO 增加全局平均池化提取全局信息
+            # 合并多尺度特征
+            mdfa_out = torch.cat([branch1_out, branch2_out, branch3_out, branch4_out], dim=1) # [160, 16, 64, 256]
+            mdfa_out = self.ftr_mdfa['fusion'](mdfa_out) # [160, 16, 64, 256]
+            
+            # 应用后处理
+            fea_specific_ftr = self.ftr_post_process(mdfa_out)  # (160,16,1,64)
+            fea_ftr = (fea_specific_ftr + fea_after_fusion)  # (160,16,1,64) = (320,16,1,64) + (320,16,1,64)
+            fea_ftr = self.ftr_task_projection_head(fea_ftr)  # ([160, 16, 1, 8])
+            fea_ftr = fea_ftr.view(fea_ftr.size(0), -1)  # (160,128)
+            logits_ftr = self.ftr_task_classifier(fea_ftr)  # (160,10)
+            pred_ftr = F.softmax(logits_ftr, dim=1)  # (160,10)
+            # 损失计算
+            orthogonal_constraint = self.calculate_orthogonal_constraint(fea_specific_ftr, fea_shared_extract)   # 0
+
+            return pred_ftr, orthogonal_constraint
+
+        else:
+            assert("TaskName Error!")
+
+
+class EEGInception(nn.Module):
+    def __init__(self, num_classes, channels=64, T=256, dropout=0.5):
+        super(EEGInception, self).__init__()
+        self.T = T
+        self.channels = channels
+        self.dropout = 0.5
+        # input size: (N, 1, channels, T)
+        self.time_block_11 = nn.Sequential(
+            nn.ZeroPad2d((31, 32, 0, 0)),
+            nn.Conv2d(1, 8, (1, 64)),  # 时序分析
+            nn.BatchNorm2d(8),
+            nn.Dropout(self.dropout),
+            nn.Conv2d(8, 16, (self.channels, 1), groups=8),  # 空间分析，片卷积（depthwse）
+            nn.BatchNorm2d(16),
+            nn.Dropout(self.dropout)
+        )
+        self.time_block_12 = nn.Sequential(
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32)),
+            nn.BatchNorm2d(8),
+            nn.Dropout(self.dropout),
+            nn.Conv2d(8, 16, (self.channels, 1), groups=8),
+            nn.BatchNorm2d(16),
+            nn.Dropout(self.dropout)
+        )
+        self.time_block_13 = nn.Sequential(
+            nn.ZeroPad2d((7, 8, 0, 0)),
+            nn.Conv2d(1, 8, (1, 16)),
+            nn.BatchNorm2d(8),
+            nn.Dropout(self.dropout),
+            nn.Conv2d(8, 16, (self.channels, 1), groups=8),
+            nn.BatchNorm2d(16),
+            nn.Dropout(self.dropout)
+        )
+
+        self.time_block_21 = nn.Sequential(
+            nn.ZeroPad2d((7, 8, 0, 0)),
+            nn.Conv2d(48, 8, (1, 16)),
+            nn.BatchNorm2d(8),
+            nn.Dropout(self.dropout)
+        )
+        self.time_block_22 = nn.Sequential(
+            nn.ZeroPad2d((3, 4, 0, 0)),
+            nn.Conv2d(48, 8, (1, 8)),
+            nn.BatchNorm2d(8),
+            nn.Dropout(self.dropout)
+        )
+        self.time_block_23 = nn.Sequential(
+            nn.ZeroPad2d((1, 2, 0, 0)),
+            nn.Conv2d(48, 8, (1, 4)),
+            nn.BatchNorm2d(8),
+            nn.Dropout(self.dropout)
+        )
+
+        self.time_block_3 = nn.Sequential(
+            nn.ZeroPad2d((3, 4, 0, 0)),
+            nn.Conv2d(24, 12, (1, 8)),
+            nn.BatchNorm2d(12),
+            nn.Dropout(self.dropout)
+        )
+
+        self.time_block_4 = nn.Sequential(
+            nn.ZeroPad2d((1, 2, 0, 0)),
+            nn.Conv2d(12, 6, (1, 4)),
+            nn.BatchNorm2d(6),
+            nn.Dropout(self.dropout)
+        )
+
+        self.pool_1 = nn.AvgPool2d((1, 4))
+        self.pool_2 = nn.AvgPool2d((1, 2))
+
+        self.fc = nn.Linear(self.T // (4 * 2 * 2 * 2) * 6, num_classes)
+
+    def forward(self, x):
+        x = x.reshape(x.shape[0], 1, x.shape[1], x.shape[2])
+        x_11 = self.time_block_11(x)
+        x_12 = self.time_block_12(x)
+        x_13 = self.time_block_13(x)
+        x = torch.cat((x_11, x_12, x_13), dim=1)
+        x = self.pool_1(x)
+
+        x_21 = self.time_block_21(x)
+        x_22 = self.time_block_22(x)
+        x_23 = self.time_block_23(x)
+        x = torch.cat((x_21, x_22, x_23), dim=1)
+        x = self.pool_2(x)
+
+        x = self.time_block_3(x)
+        x = self.pool_2(x)
+        x = self.time_block_4(x)
+        x = self.pool_2(x)
+
+        x = x.view(x.size(0), -1)
+        logits = self.fc(x)
+        probas = F.softmax(logits, dim=1)
+        return probas
+
+
+
+'''
+class VisionEagle(nn.Module):
+    def __init__(self, n_class_primary, T=256, channels=64, n_kernel_t=8, n_kernel_s=16, dropout=0.5, kernel_length=32):
+        super(VisionEagle, self).__init__()
+        self.n_class_primary = n_class_primary
+        self.channels = channels
+        self.n_kernel_t = n_kernel_t
+        self.n_kernel_s = n_kernel_s
+        self.dropout = dropout
+        self.kernel_length = kernel_length
+
+        self.block_shared_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        self.block_feature_fusion = nn.Sequential(
+            nn.ZeroPad2d((self.kernel_length // 8 - 1, self.kernel_length // 8, 0, 0)),
+            nn.Conv2d(self.n_kernel_s, self.n_kernel_s, (1, self.kernel_length // 4), groups=self.n_kernel_s,
+                      bias=False),
+            nn.Conv2d(self.n_kernel_s, self.n_kernel_s, (1, 1), bias=False),
+            nn.BatchNorm2d(self.n_kernel_s),
+            nn.ELU()
+        )
+
+        # 主任务的增强特征提取器，使用多分支结构
+        # 深度可分离卷积分支 - 用于细粒度特征提取
+        self.main_depthwise_branch = nn.Sequential(
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            nn.Conv2d(8, 8, (64, 1), groups=8, bias=False),  # 深度可分离卷积
+            nn.Conv2d(8, 16, 1, bias=False),  # 逐点卷积
+            nn.BatchNorm2d(16),
+            nn.ELU()
+        )
+        
+        # 空洞卷积分支 - 用于扩大感受野
+        self.main_dilated_branch = nn.Sequential(
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), dilation=(1, 2), bias=False),
+            nn.BatchNorm2d(8),
+            nn.Conv2d(8, 16, (64, 1), dilation=(2, 1), bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU()
+        )
+        
+        # 注意力分支 - 用于突出重要特征
+        self.main_attention_branch = nn.Sequential(
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            nn.Conv2d(8, 16, (64, 1), bias=False),
+            nn.BatchNorm2d(16),
+            nn.Sigmoid()
+        )
+        
+        # 自适应特征融合模块
+        self.main_fusion = nn.Sequential(
+            nn.Conv2d(48, 16, 1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+        
+        # 定义block_specific_main_feature_extractor为一个空Sequential，用于保持接口一致性
+        self.block_specific_main_feature_extractor = nn.Sequential()
+        # 增强时域掩码任务的特征提取器，使用多尺度时序卷积增强时域特征提取能力
+        self.block_specific_mtr_feature_extractor = nn.Sequential(
+            # 原block1 - 使用多尺度时序卷积增强时域特征提取
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 添加多尺度时序特征提取模块
+            nn.Conv2d(8, 8, (1, 3), padding=(0, 1), bias=False),  # 小尺度感受野
+            nn.ELU(),
+            nn.Conv2d(8, 8, (1, 5), padding=(0, 2), bias=False),  # 中尺度感受野
+            nn.ELU(),
+            nn.Conv2d(8, 8, (1, 7), padding=(0, 3), bias=False),  # 大尺度感受野
+            nn.ELU(),
+            # 原block2 - 空间处理保持不变
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+        # 增强空域掩码任务的特征提取器，使用空间注意力机制增强空间特征提取能力
+        self.block_specific_msr_feature_extractor = nn.Sequential(
+            # 原block1
+            nn.ZeroPad2d((15, 16, 0, 0)),
+            nn.Conv2d(1, 8, (1, 32), bias=False),
+            nn.BatchNorm2d(8),
+            # 原block2 - 增强空间特征提取
+            nn.Conv2d(8, 16, (64, 1), groups=8, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ELU()
+        )
+        
+        # 添加空间注意力模块
+        self.msr_spatial_attention = nn.Sequential(
+            # 空间注意力模块
+            nn.Conv2d(16, 1, kernel_size=7, padding=3),  # 大卷积核捕获空间依赖
+            nn.Sigmoid()
+        )
+        
+        # 添加空间特征后处理
+        self.msr_post_process = nn.Sequential(
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(self.dropout)
+        )
+
+        self.main_task_projection_head = nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+        self.vto_task_projection_head = nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+        self.msp_task_projection_head = nn.Sequential(
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(self.dropout)
+        )
+
+        # Fully-connected layer
+        self.primary_task_classifier = nn.Sequential(
+            nn.Linear(self.n_kernel_s * T // 32, self.n_class_primary)
+        )
+        self.vto_task_classifier = nn.Sequential(
+            nn.Linear(self.n_kernel_s * T // 32, 9)
+        )
+        self.msp_task_classifier = nn.Sequential(
+            nn.Linear(self.n_kernel_s * T // 32, 8)
+        )
+
+
+        self.resnet18 = models.resnet18(pretrained=True)
+        self.resnet18_2 = models.resnet18(pretrained=True)
+        # 修改第一层卷积层以处理 64 通道的输入
+        # self.conv1 = self.resnet18.conv1
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.bn1 = self.resnet18.bn1
+        self.relu = self.resnet18.relu
+        self.maxpool = self.resnet18.maxpool
+
+        # 修改第一层卷积层以处理 64 通道的输入
+        # self.conv12 = self.resnet18_2.conv1
+        self.conv12 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.bn12 = self.resnet18_2.bn1
+        self.relu2 = self.resnet18_2.relu
+        self.maxpool2 = self.resnet18_2.maxpool
+
+        self.layer1 = self.resnet18.layer1
+        self.layer2 = self.resnet18.layer2
+        self.layer3 = self.resnet18.layer3
+        self.layer4 = self.resnet18.layer4
+        self.layer12 = self.resnet18_2.layer1
+        self.layer22 = self.resnet18_2.layer2
+        self.layer32 = self.resnet18_2.layer3
+        self.layer42 = self.resnet18_2.layer4
+
+        self.scan_conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.scan_attention = nn.Conv2d(128, 1, kernel_size=1)
+        self.scan_conv22 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.scan_attention2 = nn.Conv2d(128, 1, kernel_size=1)
+        self.scan_conv23 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
+        self.scan_attention3 = nn.Conv2d(256, 1, kernel_size=1)
+
+        self.avgpool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+        self.fc = nn.Linear(512, n_class_primary)
+
+    def forward(self, x):
+        x = x.reshape(x.shape[0], 1, x.shape[1], x.shape[2])  # (32,1,64,256)
+
+        x1 = self.conv1(x) #(32,64,32,128)
+        x1 = self.bn1(x1) #(32,64,32,128)
+        x1 = self.relu(x1) #(32,64,32,128)
+        x1 = self.maxpool(x1) #(32,64,16,64)
+
+        scan_out = F.relu(self.scan_conv2(x1)) #(32,128,8,32)
+        attention_map = torch.sigmoid(self.scan_attention(scan_out)) #(32,1,8,32)
+        attention_map = F.interpolate(attention_map, size=x.size()[2:], mode='bilinear', align_corners=False) #(32,1,64,256)
+        x = x * attention_map #(32,1,64,256)
+        x = self.conv12(x) #(32,64,32,128)
+        x = self.bn12(x) #(32,64,32,128)
+        x = self.relu2(x) #(32,64,32,128)
+        x = self.maxpool2(x) #(32,64,16,64)
+        x1 = self.layer1(x) #(32,64,16,64)
+
+        scan_out = F.relu(self.scan_conv22(x1)) #(32,128,8,32)
+        attention_map = torch.sigmoid(self.scan_attention2(scan_out)) #(32,1,8,32)
+        attention_map = F.interpolate(attention_map, size=x.size()[2:], mode='bilinear', align_corners=False) #(32,1,16,64)
+        x = x * attention_map #(32,64,16,64)
+        x = self.layer12(x) #(32,64,16,64)
+        x1 = self.layer2(x) #(32,128,8,32)
+
+        scan_out = F.relu(self.scan_conv23(x1)) #(32,256,4,16)
+        attention_map = torch.sigmoid(self.scan_attention3(scan_out)) # (32,1,4,16)
+        attention_map = F.interpolate(attention_map, size=x.size()[2:], mode='bilinear', align_corners=False) # (32,1,16,64)
+        x = x * attention_map #(32,64,16,64)
+        x = self.layer22(x) #(32,128,8,32)
+        x = self.layer32(x) #(32,256,4,16)
+        x = self.layer42(x)  #(32,512,2,8)
+
+        # 推理部分
+        x = self.avgpool(x) #(32,512,1,1)
+        x = torch.flatten(x, 1) #(32,512)
+        x = self.fc(x) #(32,2)
+        probas = F.softmax(x, dim=1) #(32,2)
+        return probas
+
+'''
+
+# MedGNN
+
+class MEDGNN(nn.Module):
+    def __init__(self, num_classes=2):
+        super(MEDGNN, self).__init__()
+        # self.enc_in = configs.enc_in   # 通道数，这里是16
+        # self.seq_len = configs.seq_len # 256
+        # self.d_model = configs.d_model # 256
+        # self.d_ff = configs.d_ff # 512
+        # self.n_heads = configs.n_heads # 8
+        # self.e_layers = configs.e_layers # 4
+        # self.dropout = configs.dropout # 0.1
+        # self.output_attention = configs.output_attention #False
+        # self.activation = configs.activation   # 'gelu'
+        # self.resolution_list = list(map(int, configs.resolution_list.split(",")))   # '2,4,6,8'
+        #
+        #
+        # self.res_num = len(self.resolution_list)   # 4
+        # self.stride_list = self.resolution_list    # [2, 4, 6, 8]
+        # self.res_len = [int(self.seq_len//res)+1 for res in self.resolution_list]  # [129, 65, 43, 33]
+        # self.augmentations = configs.augmentations.split(",")   # 'none,drop0.35' -> ['none', 'drop0.35']
+
+        self.enc_in = 64  # 通道数，这里是16
+        self.seq_len = 256  # 256
+        self.d_model = 256  # 256
+        self.d_ff = 512  # 512
+        self.n_heads = 8  # 8
+        self.e_layers = 4  # 4
+        self.dropout = 0.1  # 0.1
+        self.output_attention = False  # False
+        self.activation = 'gelu'  # 'gelu'
+        self.resolution_list = [2, 4, 6, 8]  # '2,4,6,8'
+
+        self.res_num = len(self.resolution_list)  # 4
+        self.stride_list = self.resolution_list  # [2, 4, 6, 8]
+        self.res_len = [int(self.seq_len // res) + 1 for res in self.resolution_list]  # [129, 65, 43, 33]
+        self.augmentations = ['none', 'drop0.35']  # 'none,drop0.35' -> ['none', 'drop0.35']
+
+        self.num_classes = num_classes
+
+        configs = self
+
+        # step1: multi_resolution_data
+        self.multi_res_data = Multi_Resolution_Data(self.enc_in, self.resolution_list, self.stride_list)
+
+        # step2.1: frequency convolution network
+        self.freq_embedding = Frequency_Embedding(self.d_model, self.res_len, self.augmentations)
+
+        # step2.2: difference attention network
+        self.diff_data_emb = DifferenceDataEmb(self.res_num, self.enc_in, self.d_model)
+        self.difference_attention = Encoder(
+            [
+                EncoderLayer(
+                    DifferenceFormerlayer(
+                        self.enc_in,
+                        self.res_num,
+                        self.d_model,
+                        self.n_heads,
+                        self.dropout,
+                        self.output_attention
+                    ),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                )
+                for l in range(configs.e_layers)
+            ],
+            norm_layer=torch.nn.LayerNorm(configs.d_model),
+        )
+        self.data_restoration = DataRestoration(self.res_num, self.enc_in, self.d_model)
+        self.embeddings = nn.ModuleList([nn.Linear(res_len, self.d_model) for res_len in self.res_len])
+
+        # step 3: transformer
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    FormerLayer(
+                        len(self.resolution_list),
+                        configs.d_model,
+                        configs.n_heads,
+                        configs.dropout,
+                        configs.output_attention
+                    ),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                )
+                for l in range(configs.e_layers)
+            ],
+            norm_layer=torch.nn.LayerNorm(configs.d_model),
+        )
+
+        # step 4: multi-resolution GNN
+        self.mrgnn = MRGNN(configs, self.res_len)
+
+        # step 5: projection
+        self.projection = nn.Linear(self.d_model * self.enc_in, self.num_classes)
+
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+        B, T, C = x_enc.shape
+
+        # step1: multi_resolution_data
+        multi_res_data = self.multi_res_data(x_enc)
+
+        # step2.1: frequency convolution network
+        enc_out_1 = self.freq_embedding(multi_res_data)
+
+        # step2.2: difference attention network
+        x_diff_emb, x_padding = self.diff_data_emb(multi_res_data)
+        x_diff_enc, attns = self.difference_attention(x_diff_emb, attn_mask=None)
+        enc_out_2 = self.data_restoration(x_diff_enc, x_padding)
+        enc_out_2 = [self.embeddings[l](enc_out_2[l]) for l in range(self.res_num)]
+
+        # step 3: transformer
+        data_enc = [enc_out_1[l] + enc_out_2[l] for l in range(self.res_num)]
+        enc_out, attns = self.encoder(data_enc, attn_mask=None)
+
+        # step 4: multi-resolution GNN
+        output, adjacency_matrix_list = self.mrgnn(enc_out)
+
+        # step 5: projection
+        output = output.reshape(B, -1)
+        output = self.projection(output)
+
+        return output
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data = torch.tensor(np.random.rand(64, 64, 256)).to(torch.float32).to(device)
+    # 假设你有一个模型 model
+    model = MTCN(n_class_primary=2, T = 256, channels=64, n_kernel_t=8, n_kernel_s=16, dropout=0.5, kernel_length=32).to(device)
+    # model = EEGInception(num_classes=2)
+    a = model(data, "main")
+
